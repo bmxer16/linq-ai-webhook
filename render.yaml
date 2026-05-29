@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: linq-ai-webhook
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: LINQ_API_TOKEN
+        sync: false        # set in the Render dashboard (secret)
+      - key: LINQ_FROM_NUMBER
+        sync: false        # your Linq number in E.164, e.g. +18055551234
+      - key: OPENAI_API_KEY
+        sync: false        # set in the Render dashboard (secret)
+      - key: BUSINESS_NAME
+        sync: false        # optional, e.g. "Dunamis Growth Partners"
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
