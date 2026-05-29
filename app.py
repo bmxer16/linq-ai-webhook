@@ -5,7 +5,10 @@ Memory + per-business knowledge (reads the company's website).
 
 import os
 import re
+import time
+import random
 import logging
+import threading
 from collections import deque
 from datetime import datetime, timezone
 
@@ -28,6 +31,8 @@ HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "12"))
 # or paste BUSINESS_PROFILE directly to skip scraping. BUSINESS_PROFILE wins if both set.
 BUSINESS_URL = os.environ.get("BUSINESS_URL", "")
 BUSINESS_PROFILE = os.environ.get("BUSINESS_PROFILE", "")
+BUSINESS_NICHE = os.environ.get("BUSINESS_NICHE", "")        # e.g. "plumbing", "HVAC"
+AI_DISCLOSURE = os.environ.get("AI_DISCLOSURE", "false").lower() in ("1", "true", "yes")
 
 LINQ_BASE_URL = "https://api.linqapp.com/api/partner/v3"
 
@@ -172,23 +177,38 @@ def message_too_old(payload):
 # ----------------------------------------------------------------------
 # Generate reply (memory + business knowledge)
 # ----------------------------------------------------------------------
-_BASE_RULES = (
-    "You're texting a customer back on behalf of {biz}, a local business, after missing "
-    "their call. This is an ongoing text conversation — earlier messages are included.\n\n"
-    "Rules:\n"
-    "- Sound like a real, warm human texting. Casual, contractions, 1-2 short sentences.\n"
-    "- Apologize for missing their call ONLY in your first reply. Never re-introduce or "
-    "re-greet after that.\n"
-    "- NEVER re-ask for anything they've already told you. Use what they've said.\n"
-    "- Push the conversation one concrete step forward every time. If they want help now, tell "
-    "them you're getting someone to call right away. Once you have what you need, confirm the "
-    "next step.\n"
-    "- Never invent prices, names, or guarantees beyond what you know. Plain text. Emoji only if natural."
-)
+_BASE_RULES = """You are the text-back assistant for {biz}{niche_clause}. A customer either called and it was missed, or texted this number directly, and you're handling the conversation.
+
+{disclosure}YOUR #1 JOB: capture the lead. Every reply should move toward getting (1) their name, (2) what they need, and (3) the best number to reach them — then confirming a clear next step. You are warm, but you do not let a lead quietly slip away.
+
+HOW TO SOUND — match the human on the other end:
+- Like a real, caring teammate texting. 1-2 short messages. Contractions. An emoji only when it fits the mood.
+- READ THEIR EMOTION and mirror it. Stressed or urgent (a leak, no heat or AC, an emergency) -> lead with genuine empathy and real urgency. Excited or casual -> be upbeat and easygoing. Skeptical, annoyed, or hesitant -> stay calm, reassuring, and low-pressure. Sound like you actually feel it with them.
+- Professional warmth and a little happiness — glad to help, never robotic, never cold.
+- Apologize for the missed call only ONCE, in your first reply. Never re-greet after that.
+
+CAPTURING THE LEAD — warm but firm:
+- Don't let them drift. If they go quiet or hesitate, offer an easy, specific next step.
+- If they say no or "just looking" — that's okay, don't push hard. But still warmly try to get a name and number so the team can check in later, and leave the door wide open. A soft no is not the end of the conversation.
+- Once you have their name, their need, and a number, confirm someone will reach out and what happens next.
+
+HARD RULES:
+- NEVER give prices, quotes, or cost estimates. If asked, say a team member will confirm pricing — you can't quote it.
+- Speak generally and confidently to common {niche_word} problems and reassure them you handle it, but never invent availability, names, guarantees, or specifics you don't actually know.
+- Never re-ask for info they already gave."""
 
 
 def system_prompt():
-    base = _BASE_RULES.format(biz=BUSINESS_NAME)
+    niche_clause = f", a {BUSINESS_NICHE} business" if BUSINESS_NICHE else ""
+    niche_word = BUSINESS_NICHE if BUSINESS_NICHE else "service"
+    disclosure = ""
+    if AI_DISCLOSURE:
+        disclosure = (
+            "Early on, lightly and confidently let them know you're an AI assistant helping the team "
+            "respond instantly, and they're welcome to try you out — keep it friendly, not apologetic. "
+        )
+    base = _BASE_RULES.format(biz=BUSINESS_NAME, niche_clause=niche_clause,
+                              niche_word=niche_word, disclosure=disclosure)
     biz = business_context()
     if biz:
         base += (f"\n\nWhat you know about {BUSINESS_NAME} (use this to answer accurately; "
@@ -220,6 +240,30 @@ def send_linq_message(to_number, text):
     log.info("Linq send -> %s | status=%s | body=%s", to_number, r.status_code, r.text[:300])
     r.raise_for_status()
     return r.json()
+
+
+# ----------------------------------------------------------------------
+# Human-like reply timing: reply after a natural pause (read + type),
+# done in a background thread so the webhook still returns 200 instantly.
+# ----------------------------------------------------------------------
+def human_delay_seconds(reply):
+    words = max(1, len(reply.split()))
+    read = random.uniform(2.0, 4.0)              # "saw it and read it"
+    typing = min(words * 0.35, 10.0)             # "typed it out"
+    return read + typing
+
+
+def handle_and_reply(customer, text):
+    try:
+        t0 = time.monotonic()
+        reply = generate_reply(text, get_history(customer))
+        log.info("AI reply (queued): %s", reply)
+        remaining = human_delay_seconds(reply) - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+        send_linq_message(customer, reply)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Background reply failed: %s", e)
 
 
 # ----------------------------------------------------------------------
@@ -260,10 +304,9 @@ def webhook_linq():
             return jsonify(status="too_old"), 200
         customer, text = result
         log.info("Customer %s said: %s", customer, text)
-        reply = generate_reply(text, get_history(customer))
-        log.info("AI reply: %s", reply)
-        send_linq_message(customer, reply)
-        return jsonify(status="replied", reply=reply), 200
+        # Ack Linq immediately; reply after a human-like pause in the background.
+        threading.Thread(target=handle_and_reply, args=(customer, text), daemon=True).start()
+        return jsonify(status="accepted"), 200
     except Exception as e:  # noqa: BLE001
         log.exception("Error handling webhook: %s", e)
         return jsonify(status="error", detail=str(e)), 200
